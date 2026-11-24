@@ -32,8 +32,8 @@ def decide(s,p,target,msg):
  with urllib.request.urlopen(req,timeout=90) as r: data=json.load(r)
  s['calls']+=1; s['last_latency']=round(time.monotonic()-start,2)
  return json.loads(data['choices'][0]['message']['content'])
-def act(s,p,target,msg):
- d=decide(s,p,target,msg); action=d.get('action','speak'); action=action if action in ['speak','ask','refuse','move','wait'] else 'wait'; dialogue=str(d.get('dialogue',''))[:350]; delta=d.get('trust_delta',0); delta=max(-5,min(5,delta)) if type(delta)==int else 0
+def act(s,p,target,msg,decision=None):
+ d=decision if decision is not None else decide(s,p,target,msg); action=d.get('action','speak'); action=action if action in ['speak','ask','refuse','move','wait'] else 'wait'; dialogue=str(d.get('dialogue',''))[:350]; delta=d.get('trust_delta',0); delta=max(-5,min(5,delta)) if type(delta)==int else 0
  if action=='move' and d.get('place') in ['bar','table','door','fire']: p['place']=d['place']
  p['trust'][target]=max(0,min(100,p['trust'].get(target,50)+delta)); s['tick']+=1
  e={'tick':s['tick'],'speaker':p['name'],'target':target,'input':msg,'dialogue':dialogue,'action':action}; s['events'].append(e); s['events']=s['events'][-200:]; p['memory'].append({'heard':msg,'said':dialogue,'target':target}); p['memory']=p['memory'][-100:]
@@ -57,7 +57,12 @@ def turn():
     p=s['npcs'][s['tick']%4]; q=s['npcs'][(s['tick']+1)%4]; target=q['id']; msg='Choose your next action toward '+q['name']+' at '+q['place']+' in pursuit of your goal.'
    else:
     p=next(n for n in s['npcs'] if n['id']==npc);target='player'
-   act(s,p,target,msg);save(s);return jsonify(public(s))
+   decision=b.get('decision')
+   if decision is not None:
+    if not isinstance(decision,dict) or b.get('tick')!=s['tick']: return jsonify(error='World changed; refresh and retry.'),409
+    s['calls']+=1
+    s['last_latency']=round(max(0,min(600,float(b.get('latency',0)))),2)
+   act(s,p,target,msg,decision);save(s);return jsonify(public(s))
   except Exception:
    app.logger.exception('Decision failed')
    return jsonify(error='Decision failed. Check model configuration and server logs.'),502
