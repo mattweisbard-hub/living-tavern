@@ -1,4 +1,4 @@
-import os,json,sqlite3,threading,time,uuid,urllib.request
+import os,json,sqlite3,threading,time,uuid,urllib.request,hmac
 from flask import Flask,request,jsonify,send_from_directory,session
 app=Flask(__name__)
 app.secret_key=os.getenv('SECRET_KEY') or os.urandom(32)
@@ -8,6 +8,10 @@ MODEL=os.getenv('MODEL','qwen2.5:1.5b')
 BASE=os.getenv('LLM_URL','http://127.0.0.1:11434/v1')
 KEY=os.getenv('LLM_KEY','')
 MODE=os.getenv('MODE','demo')
+ACCESS=os.getenv('TAVERN_ACCESS_CODE','')
+MAX_CALLS=max(1,int(os.getenv('MAX_DAILY_CALLS','100')))
+app.config['MAX_CONTENT_LENGTH']=8192
+with sqlite3.connect(DB) as c: c.execute('create table if not exists inference_usage(day text primary key, calls integer not null)')
 PEOPLE=[dict(id='edmund',name='Edmund',role='Innkeeper',trait='Proud, pragmatic, cautious',goal='Protect the tavern and conceal debt',secret='Roland demanded repayment yesterday.',color='#d7a254',place='bar'),dict(id='marta',name='Marta',role='Merchant',trait='Ambitious, impatient, suspicious',goal='Recover missing shipment',secret='The shipment contained valuable silk.',color='#78b9b1',place='table'),dict(id='roland',name='Roland',role='Guard',trait='Loyal, insecure, defensive',goal='Protect reputation and find evidence',secret='Saw an unfamiliar cart near the warehouse.',color='#b77c7c',place='door'),dict(id='isabel',name='Isabel',role='Traveler',trait='Observant, secretive, wary',goal='Leave town safely',secret='Saw a cart with a broken wheel near the warehouse.',color='#a69bcc',place='fire')]
 def conn(): return sqlite3.connect(DB)
 with conn() as c: c.execute('create table if not exists worlds(id text primary key,state text)')
@@ -18,7 +22,21 @@ def load():
  return json.loads(r[0]) if r else fresh()
 def save(s):
  with conn() as c: c.execute('insert or replace into worlds values(?,?)',(session['world'],json.dumps(s)))
-def public(s): return {**s,'mode':MODE,'model':MODEL}
+def public(s): return {**s,'mode':MODE,'model':MODEL,'locked':MODE!='demo' and not session.get('ai_authorized'), 'limit':MAX_CALLS}
+@app.post('/api/unlock')
+def unlock():
+ b=request.get_json(silent=True) or {}
+ if not ACCESS or not hmac.compare_digest(str(b.get('code','')),ACCESS): return jsonify(error='Incorrect access code.'),403
+ session['ai_authorized']=True
+ return {'ok':True}
+def reserve_call():
+ day=time.strftime('%Y-%m-%d',time.gmtime())
+ with conn() as c:
+  c.execute('begin immediate')
+  row=c.execute('select calls from inference_usage where day=?',(day,)).fetchone()
+  if row and row[0]>=MAX_CALLS: return False
+  c.execute('insert into inference_usage values(?,1) on conflict(day) do update set calls=calls+1',(day,))
+ return True
 def decide(s,p,target,msg):
  if MODE=='demo':
   lines={'edmund':['Keep your voice down. My tavern has enough troubles.','Perhaps Marta knows more about the shipment.','I should check the bar.'],'marta':['I need evidence, not another rumor. Will you help me?','The shipment contained valuable silk.','I must speak to the guard.'],'roland':['I am investigating. Do not mistake suspicion for proof.','I saw an unfamiliar cart near the warehouse.','I should keep watch at the door.'],'isabel':['There are things I would rather not discuss in public.','I noticed a cart with a broken wheel.','I prefer to stay near the fire.']}
@@ -29,11 +47,11 @@ def decide(s,p,target,msg):
  body={'model':MODEL,'messages':[{'role':'system','content':prompt},{'role':'user','content':json.dumps({'target':target,'event':msg})}],'temperature':0.5,'max_tokens':140,'stream':False,'response_format':{'type':'json_object'}}
  req=urllib.request.Request(BASE.rstrip('/')+'/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+KEY})
  start=time.monotonic()
- with urllib.request.urlopen(req,timeout=90) as r: data=json.load(r)
+ with urllib.request.urlopen(req,timeout=45) as r: data=json.load(r)
  s['calls']+=1; s['last_latency']=round(time.monotonic()-start,2)
  return json.loads(data['choices'][0]['message']['content'])
-def act(s,p,target,msg,decision=None):
- d=decision if decision is not None else decide(s,p,target,msg); action=d.get('action','speak'); action=action if action in ['speak','ask','refuse','move','wait'] else 'wait'; dialogue=str(d.get('dialogue',''))[:350]; delta=d.get('trust_delta',0); delta=max(-5,min(5,delta)) if type(delta)==int else 0
+def act(s,p,target,msg):
+ d=decide(s,p,target,msg); action=d.get('action','speak'); action=action if action in ['speak','ask','refuse','move','wait'] else 'wait'; dialogue=str(d.get('dialogue',''))[:350]; delta=d.get('trust_delta',0); delta=max(-5,min(5,delta)) if type(delta)==int else 0
  if action=='move' and d.get('place') in ['bar','table','door','fire']: p['place']=d['place']
  p['trust'][target]=max(0,min(100,p['trust'].get(target,50)+delta)); s['tick']+=1
  e={'tick':s['tick'],'speaker':p['name'],'target':target,'input':msg,'dialogue':dialogue,'action':action}; s['events'].append(e); s['events']=s['events'][-200:]; p['memory'].append({'heard':msg,'said':dialogue,'target':target}); p['memory']=p['memory'][-100:]
@@ -57,12 +75,11 @@ def turn():
     p=s['npcs'][s['tick']%4]; q=s['npcs'][(s['tick']+1)%4]; target=q['id']; msg='Choose your next action toward '+q['name']+' at '+q['place']+' in pursuit of your goal.'
    else:
     p=next(n for n in s['npcs'] if n['id']==npc);target='player'
-   decision=b.get('decision')
-   if decision is not None:
-    if not isinstance(decision,dict) or b.get('tick')!=s['tick']: return jsonify(error='World changed; refresh and retry.'),409
-    s['calls']+=1
-    s['last_latency']=round(max(0,min(600,float(b.get('latency',0)))),2)
-   act(s,p,target,msg,decision);save(s);return jsonify(public(s))
+   if MODE!='demo':
+    if not KEY or not ACCESS: return jsonify(error='Cloud model credentials and access code must be configured.'),503
+    if not session.get('ai_authorized'): return jsonify(error='Unlock cloud AI first.'),403
+    if not reserve_call(): return jsonify(error='Daily AI decision limit reached.'),429
+   act(s,p,target,msg);save(s);return jsonify(public(s))
   except Exception:
    app.logger.exception('Decision failed')
    return jsonify(error='Decision failed. Check model configuration and server logs.'),502
