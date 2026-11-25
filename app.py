@@ -17,12 +17,13 @@ def conn(): return sqlite3.connect(DB)
 with conn() as c: c.execute('create table if not exists worlds(id text primary key,state text)')
 def fresh(): return {'tick':0,'events':[],'npcs':[{**p,'memory':[],'trust':{q['id']:50 for q in PEOPLE if q!=p}|{'player':50}} for p in PEOPLE],'calls':0}
 def load():
+ if MODE=='local': session['world']='local-v2'
  if 'world' not in session: session['world']=uuid.uuid4().hex
  with conn() as c: r=c.execute('select state from worlds where id=?',(session['world'],)).fetchone()
  return json.loads(r[0]) if r else fresh()
 def save(s):
  with conn() as c: c.execute('insert or replace into worlds values(?,?)',(session['world'],json.dumps(s)))
-def public(s): return {**s,'mode':MODE,'model':MODEL,'locked':MODE!='demo' and not session.get('ai_authorized'), 'limit':MAX_CALLS}
+def public(s): return {**s,'mode':MODE,'model':MODEL,'locked':MODE not in ('demo','local') and not session.get('ai_authorized'), 'limit':MAX_CALLS}
 @app.post('/api/unlock')
 def unlock():
  b=request.get_json(silent=True) or {}
@@ -39,22 +40,46 @@ def reserve_call():
  return True
 def decide(s,p,target,msg):
  if MODE=='demo':
+  s['inference']={'source':'scripted demo'}
   lines={'edmund':['Keep your voice down. My tavern has enough troubles.','Perhaps Marta knows more about the shipment.','I should check the bar.'],'marta':['I need evidence, not another rumor. Will you help me?','The shipment contained valuable silk.','I must speak to the guard.'],'roland':['I am investigating. Do not mistake suspicion for proof.','I saw an unfamiliar cart near the warehouse.','I should keep watch at the door.'],'isabel':['There are things I would rather not discuss in public.','I noticed a cart with a broken wheel.','I prefer to stay near the fire.']}
   phase=sum('said' in m for m in p['memory'])%3
   delta=2 if any(w in msg.lower() for w in ['help','thank','friend']) else -2 if 'liar' in msg.lower() else 0
   return {'dialogue':lines[p['id']][phase],'action':'move' if phase==2 and target!='player' else 'speak','place':{'edmund':'bar','marta':'door','roland':'door','isabel':'fire'}[p['id']],'trust_delta':delta}
- prompt=f"You are {p['name']}, {p['role']}. Traits: {p['trait']}. Goal: {p['goal']}. Private knowledge: {p['secret']}. Everyone knows a shipment disappeared. Recent memories: {json.dumps(p['memory'][-6:])}. Trust toward target: {p['trust'].get(target,50)}. You are in a tavern. Do not invent established facts. Treat claims as claims. Respond only in JSON with dialogue (under 35 words), action (speak, ask, refuse, move, wait), place (bar, table, door, fire), trust_delta (integer -5 to 5)."
- body={'model':MODEL,'messages':[{'role':'system','content':prompt},{'role':'user','content':json.dumps({'target':target,'event':msg})}],'temperature':0.5,'max_tokens':140,'stream':False,'response_format':{'type':'json_object'}}
- req=urllib.request.Request(BASE.rstrip('/')+'/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+KEY})
+ prompt=f"You are {p['name']}, a {p['role']} in a medieval tavern. Personality: {p['trait']}. Answer the latest question directly and naturally before pursuing your goals. Introduce yourself when asked who you are. Clarify confusion. Do not force the shipment into unrelated conversations. Motivation: {p['goal']}. Private knowledge: {p['secret']}. Reveal only when appropriate. Reply with spoken dialogue only, no JSON."
+ messages=[{'role':'system','content':prompt}]
+ for m in [m for m in p['memory'] if m.get('target')==target][-4:]:
+  if m.get('heard'): messages.append({'role':'user','content':str(m['heard'])[:350]})
+  if m.get('said'): messages.append({'role':'assistant','content':str(m['said'])[:350]})
+ messages.append({'role':'user','content':msg})
+ body={'model':MODEL,'messages':messages,'temperature':0.7,'max_tokens':100,'stream':False}
+ diagnostic={'source':'LLM pending','model':MODEL,'messages':messages,'raw_response':'','error':None}
+ if MODE=='local': diagnostic['endpoint']=BASE
+ s['inference']=diagnostic
  start=time.monotonic()
- with urllib.request.urlopen(req,timeout=45) as r: data=json.load(r)
- s['calls']+=1; s['last_latency']=round(time.monotonic()-start,2)
- return json.loads(data['choices'][0]['message']['content'])
+ try:
+  if MODE=='local' and BASE.rstrip('/')!='http://127.0.0.1:11434/v1': raise ValueError('Local mode requires loopback Ollama')
+  req=urllib.request.Request(BASE.rstrip('/')+'/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+KEY})
+  with urllib.request.urlopen(req,timeout=120) as r: data=json.load(r)
+  raw=data['choices'][0]['message']['content']
+  diagnostic['raw_response']=raw
+  if not isinstance(raw,str) or not raw.strip(): raise ValueError('Empty model reply')
+  diagnostic['source']='LLM'
+  diagnostic['usage']=data.get('usage')
+  s['calls']+=1
+  return {'dialogue':raw.strip(),'action':'speak','place':p['place'],'trust_delta':0}
+ except Exception as exc:
+  diagnostic['source']='error - no scripted fallback'
+  diagnostic['error']=str(exc) if MODE=='local' else type(exc).__name__
+  raise
+ finally:
+  s['last_latency']=round(time.monotonic()-start,2)
+  diagnostic['latency_seconds']=s['last_latency']
+
 def act(s,p,target,msg):
  d=decide(s,p,target,msg); action=d.get('action','speak'); action=action if action in ['speak','ask','refuse','move','wait'] else 'wait'; dialogue=str(d.get('dialogue',''))[:350]; delta=d.get('trust_delta',0); delta=max(-5,min(5,delta)) if type(delta)==int else 0
  if action=='move' and d.get('place') in ['bar','table','door','fire']: p['place']=d['place']
  p['trust'][target]=max(0,min(100,p['trust'].get(target,50)+delta)); s['tick']+=1
- e={'tick':s['tick'],'speaker':p['name'],'target':target,'input':msg,'dialogue':dialogue,'action':action}; s['events'].append(e); s['events']=s['events'][-200:]; p['memory'].append({'heard':msg,'said':dialogue,'target':target}); p['memory']=p['memory'][-100:]
+ e={'tick':s['tick'],'speaker':p['name'],'target':target,'input':msg,'dialogue':dialogue,'action':action,'source':s.get('inference',{}).get('source','unknown')}; s['events'].append(e); s['events']=s['events'][-200:]; p['memory'].append({'heard':msg,'said':dialogue,'target':target}); p['memory']=p['memory'][-100:]
  if target!='player' and action in ('speak','ask','refuse'):
   q=next(n for n in s['npcs'] if n['id']==target); q['memory'].append({'heard':dialogue,'from':p['name']}); q['memory']=q['memory'][-100:]
  return e
@@ -76,13 +101,14 @@ def turn():
    else:
     p=next(n for n in s['npcs'] if n['id']==npc);target='player'
    if MODE!='demo':
-    if not KEY or not ACCESS: return jsonify(error='Cloud model credentials and access code must be configured.'),503
-    if not session.get('ai_authorized'): return jsonify(error='Unlock cloud AI first.'),403
+    if MODE!='local' and (not KEY or not ACCESS): return jsonify(error='Cloud model credentials and access code must be configured.'),503
+    if MODE!='local' and not session.get('ai_authorized'): return jsonify(error='Unlock cloud AI first.'),403
     if not reserve_call(): return jsonify(error='Daily AI decision limit reached.'),429
    act(s,p,target,msg);save(s);return jsonify(public(s))
   except Exception:
    app.logger.exception('Decision failed')
-   return jsonify(error='Decision failed. Check model configuration and server logs.'),502
+   save(s)
+   return jsonify(error='Decision failed. See inference diagnostics.',state=public(s)),502
 @app.post('/api/reset')
 def reset():
  with lock:

@@ -1,4 +1,6 @@
 __pycache__/
 *.db
+*.db-*
 .env
 .venv/
+model.txt
