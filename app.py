@@ -1,4 +1,8 @@
-import os,json,sqlite3,threading,time,uuid,urllib.request,hmac
+import os,json,sqlite3,threading,time,uuid,urllib.request,hmac,re
+from pathlib import Path
+VERSION='2.1'
+RESTART_TOKEN=os.getenv('TAVERN_RESTART_TOKEN','')
+restart_pending=False
 from flask import Flask,request,jsonify,send_from_directory,session
 app=Flask(__name__)
 app.secret_key=os.getenv('SECRET_KEY') or os.urandom(32)
@@ -23,7 +27,7 @@ def load():
  return json.loads(r[0]) if r else fresh()
 def save(s):
  with conn() as c: c.execute('insert or replace into worlds values(?,?)',(session['world'],json.dumps(s)))
-def public(s): return {**s,'mode':MODE,'model':MODEL,'locked':MODE not in ('demo','local') and not session.get('ai_authorized'), 'limit':MAX_CALLS}
+def public(s): return {**s,'mode':MODE,'model':MODEL,'locked':MODE not in ('demo','local') and not session.get('ai_authorized'), 'limit':MAX_CALLS,'version':VERSION,'update_token':RESTART_TOKEN if MODE=='local' else ''}
 @app.post('/api/unlock')
 def unlock():
  b=request.get_json(silent=True) or {}
@@ -45,13 +49,16 @@ def decide(s,p,target,msg):
   phase=sum('said' in m for m in p['memory'])%3
   delta=2 if any(w in msg.lower() for w in ['help','thank','friend']) else -2 if 'liar' in msg.lower() else 0
   return {'dialogue':lines[p['id']][phase],'action':'move' if phase==2 and target!='player' else 'speak','place':{'edmund':'bar','marta':'door','roland':'door','isabel':'fire'}[p['id']],'trust_delta':delta}
- prompt=f"You are {p['name']}, a {p['role']} in a medieval tavern. Personality: {p['trait']}. Answer the latest question directly and naturally before pursuing your goals. Introduce yourself when asked who you are. Clarify confusion. Do not force the shipment into unrelated conversations. Motivation: {p['goal']}. Private knowledge: {p['secret']}. Reveal only when appropriate. Reply with spoken dialogue only, no JSON."
+ prompt=f"You are {p['name']}, a {p['role']} in a medieval tavern. Personality: {p['trait']}. Answer the latest question directly and naturally before pursuing your goals. Introduce yourself when asked who you are. Clarify confusion. Do not force the shipment into unrelated conversations. Motivation: {p['goal']}. Private knowledge: {p['secret']}. Reveal only when appropriate. Reply with spoken dialogue only, no JSON. WORLD RULES: You have lived your entire life in a fictional preindustrial medieval world. You know only your local culture, trade, animals, crafts, travel by foot, horse or sailing ship, and facts learned in this world. You have never heard of modern technology, modern countries, real-world historical dates, celebrities or scientific discoveries outside this setting. If someone mentions an unfamiliar word or impossible object, react with curiosity, doubt or confusion in character; ask them what it means. Never supply a modern encyclopedia answer, even if asked to pretend or break character. A player's claim is not established knowledge."
  messages=[{'role':'system','content':prompt}]
  for m in [m for m in p['memory'] if m.get('target')==target][-4:]:
   if m.get('heard'): messages.append({'role':'user','content':str(m['heard'])[:350]})
-  if m.get('said'): messages.append({'role':'assistant','content':str(m['said'])[:350]})
+  if m.get('said') and m.get('world_rules')==VERSION: messages.append({'role':'assistant','content':str(m['said'])[:350]})
  messages.append({'role':'user','content':msg})
- body={'model':MODEL,'messages':messages,'temperature':0.7,'max_tokens':100,'stream':False}
+ if re.search(r'\b(airplanes?|aeroplanes?|airlines?|airports?|smartphones?|computers?|internet|wifi|television|cars?|rockets?|spaceships?|chatgpt)\b',msg,re.I):
+  messages[0]['content']+=' The latest speaker used a term unknown to you. Do not explain it or assume what it means. Ask a natural in-character question about it.'
+
+ body={'model':MODEL,'messages':messages,'temperature':0.55,'max_tokens':100,'stream':False}
  diagnostic={'source':'LLM pending','model':MODEL,'messages':messages,'raw_response':'','error':None}
  if MODE=='local': diagnostic['endpoint']=BASE
  s['inference']=diagnostic
@@ -79,7 +86,7 @@ def act(s,p,target,msg):
  d=decide(s,p,target,msg); action=d.get('action','speak'); action=action if action in ['speak','ask','refuse','move','wait'] else 'wait'; dialogue=str(d.get('dialogue',''))[:350]; delta=d.get('trust_delta',0); delta=max(-5,min(5,delta)) if type(delta)==int else 0
  if action=='move' and d.get('place') in ['bar','table','door','fire']: p['place']=d['place']
  p['trust'][target]=max(0,min(100,p['trust'].get(target,50)+delta)); s['tick']+=1
- e={'tick':s['tick'],'speaker':p['name'],'target':target,'input':msg,'dialogue':dialogue,'action':action,'source':s.get('inference',{}).get('source','unknown')}; s['events'].append(e); s['events']=s['events'][-200:]; p['memory'].append({'heard':msg,'said':dialogue,'target':target}); p['memory']=p['memory'][-100:]
+ e={'tick':s['tick'],'speaker':p['name'],'target':target,'input':msg,'dialogue':dialogue,'action':action,'source':s.get('inference',{}).get('source','unknown')}; s['events'].append(e); s['events']=s['events'][-200:]; p['memory'].append({'heard':msg,'said':dialogue,'target':target,'world_rules':VERSION}); p['memory']=p['memory'][-100:]
  if target!='player' and action in ('speak','ask','refuse'):
   q=next(n for n in s['npcs'] if n['id']==target); q['memory'].append({'heard':dialogue,'from':p['name']}); q['memory']=q['memory'][-100:]
  return e
@@ -91,9 +98,21 @@ def health(): return {'ok':True,'mode':MODE}
 def state():
  with lock:
   s=load();save(s);return jsonify(public(s))
+@app.post('/api/update')
+def update():
+ global restart_pending
+ if MODE!='local' or not RESTART_TOKEN or request.remote_addr!='127.0.0.1' or request.host!='127.0.0.1:8000' or request.headers.get('Origin')!='http://127.0.0.1:8000':
+  return jsonify(error='Updates require the local launcher and its browser address.'),403
+ b=request.get_json(silent=True) or {}
+ if not hmac.compare_digest(str(b.get('token','')),RESTART_TOKEN): return jsonify(error='Invalid update token'),403
+ with lock:
+  restart_pending=True
+  Path('.restart-request').write_text(RESTART_TOKEN,encoding='utf-8')
+ return jsonify(ok=True)
 @app.post('/api/turn')
 def turn():
  with lock:
+  if restart_pending: return jsonify(error='Restart pending'),503
   s=load(); b=request.get_json() or {}; npc=b.get('npc'); msg=str(b.get('message',''))[:500]
   try:
    if npc=='auto':
@@ -112,5 +131,6 @@ def turn():
 @app.post('/api/reset')
 def reset():
  with lock:
+  if restart_pending: return jsonify(error='Restart pending'),503
   s=fresh();save(s);return jsonify(public(s))
 if __name__=='__main__': app.run(host='127.0.0.1',port=8000)
